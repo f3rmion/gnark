@@ -553,11 +553,14 @@ func Prove(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, opts ...b
 		return nil
 	}
 
-	// Serialize MSM operations to avoid icicle-gnark v3.2.2 concurrent MSM bug.
-	// RunOnDevice produces incorrect values when multiple goroutines perform
-	// concurrent MSM operations on the same device.
+	// Serialize ALL MSM operations into a single RunOnDevice call to avoid
+	// icicle-gnark v3.2.2 concurrent MSM bug. RunOnDevice spawns a goroutine
+	// internally (see runtime.go:94), so separate RunOnDevice calls execute
+	// concurrently and corrupt GPU state. All four MSM stages (AR1, BS1, BS2,
+	// KRS) must run sequentially on one device-bound goroutine.
 	// See: icicle-gnark/v3@v3.2.2/wrappers/golang/curves/bn254/tests/msm_test.go:262
 	//   "// TODO - RunOnDevice causes incorrect values"
+	allMsmDone := make(chan struct{})
 	icicle_runtime.RunOnDevice(&device, func(args ...any) {
 		if err := computeAR1(); err != nil {
 			panic(fmt.Sprintf("compute AR1: %v", err))
@@ -568,19 +571,14 @@ func Prove(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, opts ...b
 		if err := computeBS2(); err != nil {
 			panic(fmt.Sprintf("compute BS2: %v", err))
 		}
-	})
-
-	// wait for FFT to end
-	<-chHDone
-
-	computeKrsDone := make(chan struct{})
-	icicle_runtime.RunOnDevice(&device, func(args ...any) {
+		// Wait for H polynomial (FFT) to complete before KRS MSMs.
+		<-chHDone
 		if err := computeKRS(); err != nil {
 			panic(fmt.Sprintf("compute KRS: %v", err))
 		}
-		close(computeKrsDone)
+		close(allMsmDone)
 	})
-	<-computeKrsDone
+	<-allMsmDone
 
 	log.Debug().Dur("took", time.Since(start)).Msg("prover done")
 

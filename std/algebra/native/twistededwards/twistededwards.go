@@ -15,18 +15,32 @@ import (
 	edbw6761 "github.com/consensys/gnark-crypto/ecc/bw6-761/twistededwards"
 	"github.com/consensys/gnark-crypto/ecc/twistededwards"
 	"github.com/consensys/gnark/frontend"
+	"github.com/consensys/gnark/std/algebra/algopts"
 )
 
 // Curve methods implemented by a twisted edwards curve inside a circuit
 type Curve interface {
 	Params() *CurveParams
-	Endo() *EndoParams
+	// Add computes p1+p2 for inputs that lie on the curve.
 	Add(p1, p2 Point) Point
+	// Double computes 2*p1 for an input point that lies on the curve.
 	Double(p1 Point) Point
+	// Neg computes -p1 for an input point that lies on the curve.
 	Neg(p1 Point) Point
+	// AssertIsOnCurve constrains p1 to satisfy the twisted Edwards curve equation.
 	AssertIsOnCurve(p1 Point)
+	// ScalarMul computes [scalar]p1. p1 must lie in the prime-order subgroup; for
+	// such points it is complete for all scalar inputs, including zero.
 	ScalarMul(p1 Point, scalar frontend.Variable) Point
-	DoubleBaseScalarMul(p1, p2 Point, s1, s2 frontend.Variable) Point
+	// DoubleBaseScalarMul computes [s1]p1+[s2]p2 for points that lie on the curve.
+	// It is complete by default; passing algopts.WithIncompleteArithmetic
+	// dispatches to the faster lattice MSM path (see DoubleBaseScalarMulNonZero).
+	DoubleBaseScalarMul(p1, p2 Point, s1, s2 frontend.Variable, opts ...algopts.AlgebraOption) Point
+	// DoubleBaseScalarMulNonZero computes [s1]p1+[s2]p2 with the optimized
+	// lattice MSM path. It requires p1, p2 to lie in the prime-order subgroup and
+	// to be non-identity, and s1, s2 to be nonzero; for the GLV path the result
+	// must also be non-identity.
+	DoubleBaseScalarMulNonZero(p1, p2 Point, s1, s2 frontend.Variable) Point
 	API() frontend.API
 }
 
@@ -42,7 +56,10 @@ type CurveParams struct {
 	Base                  [2]*big.Int // base point coordinates
 }
 
-// EndoParams endomorphism parameters for the curve, if they exist
+// EndoParams holds the GLV endomorphism parameters for curves that have one
+// (Bandersnatch). The endomorphism Φ(x, y) = ((Endo[0]·(1−y²)/(x·y) + …) acts as
+// scalar multiplication by Lambda on the prime-order subgroup. This is used
+// only by the `doubleBaseScalarMul6MSMLogUp` MSM(6, n/3) variant.
 type EndoParams struct {
 	Endo   [2]*big.Int
 	Lambda *big.Int
@@ -61,9 +78,8 @@ func NewEdCurve(api frontend.API, id twistededwards.ID) (Curve, error) {
 	if err != nil {
 		return nil, err
 	}
-	var endo *EndoParams
 
-	// bandersnatch
+	var endo *EndoParams
 	if id == twistededwards.BLS12_381_BANDERSNATCH {
 		endo = &EndoParams{
 			Endo:   [2]*big.Int{new(big.Int), new(big.Int)},
@@ -74,7 +90,6 @@ func NewEdCurve(api frontend.API, id twistededwards.ID) (Curve, error) {
 		endo.Lambda.SetString("8913659658109529928382530854484400854125314752504019737736543920008458395397", 10)
 	}
 
-	// default
 	return &curve{api: api, params: params, endo: endo, id: id}, nil
 }
 

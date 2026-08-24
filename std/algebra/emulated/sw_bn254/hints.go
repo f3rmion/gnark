@@ -2,8 +2,10 @@ package sw_bn254
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 
+	"github.com/consensys/gnark-crypto/algebra/lattice"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark/constraint/solver"
 	"github.com/consensys/gnark/std/math/emulated"
@@ -19,7 +21,72 @@ func GetHints() []solver.Hint {
 		finalExpHint,
 		pairingCheckHint,
 		millerLoopAndCheckFinalExpHint,
+		scalarMulG2Hint,
+		scalarMulG2CofactorPreimageHint,
+		g2CombRecodeHint,
+		g2CombChainLambdaHint,
+		rationalReconstructExtG2,
 	}
+}
+
+// g2CofactorClearingConstant is the cofactor-clearing constant for BN254 G2:
+// the product of every cofactor prime < 2^nbits (h = 10069·5864401·1875725156269·
+// (177-bit prime)). All three small primes are reachable by the r^(1/4) sub-scalars
+// (1875725156269 ≈ 2^41 < 2^nbits = 2^66), so [c]·E'(𝔽ₚ²) removes exactly the
+// exploitable torsion; the 177-bit prime part has order ≫ 2^nbits. Omitting e.g.
+// 5864401 or 1875725156269 leaves a chosen-scalar torsion forgery of that order
+// open, since [c] stays invertible on that torsion.
+var g2CofactorClearingConstant = func() *big.Int {
+	c := big.NewInt(10069)
+	c.Mul(c, big.NewInt(5864401))
+	c.Mul(c, big.NewInt(1875725156269))
+	return c
+}()
+
+// scalarMulG2CofactorPreimageHint returns S = [s · c⁻¹ mod r]·Q, a preimage of
+// R = [s]Q under multiplication by the cofactor-clearing constant c.
+// The in-circuit check [c]S == R with S constrained on-curve forces R into the
+// prime-order subgroup: a torsion-shifted R' = [s]Q + T (ord(T) | 10069) has no
+// on-curve preimage under [c], so no satisfying S exists.
+func scalarMulG2CofactorPreimageHint(field *big.Int, inputs []*big.Int, outputs []*big.Int) error {
+	return emulated.UnwrapHintContext(field, inputs, outputs, func(hc emulated.HintContext) error {
+		moduli := hc.EmulatedModuli()
+		if len(moduli) != 2 {
+			return fmt.Errorf("expecting two moduli, got %d", len(moduli))
+		}
+		baseModulus, scalarModulus := moduli[0], moduli[1]
+		baseInputs, baseOutputs := hc.InputsOutputs(baseModulus)
+		scalarInputs, _ := hc.InputsOutputs(scalarModulus)
+		if len(baseInputs) != 4 {
+			return fmt.Errorf("expecting four base inputs (Q.X.A0, Q.X.A1, Q.Y.A0, Q.Y.A1), got %d", len(baseInputs))
+		}
+		if len(baseOutputs) != 4 {
+			return fmt.Errorf("expecting four base outputs, got %d", len(baseOutputs))
+		}
+		if len(scalarInputs) != 1 {
+			return fmt.Errorf("expecting one scalar input, got %d", len(scalarInputs))
+		}
+
+		cInv := new(big.Int).ModInverse(g2CofactorClearingConstant, scalarModulus)
+		if cInv == nil {
+			return fmt.Errorf("cofactor-clearing constant not invertible mod r")
+		}
+		m := new(big.Int).Mul(scalarInputs[0], cInv)
+		m.Mod(m, scalarModulus)
+
+		// S = [s · c⁻¹ mod r]·Q, so [c]S = [s]Q = R.
+		var Q bn254.G2Affine
+		Q.X.A0.SetBigInt(baseInputs[0])
+		Q.X.A1.SetBigInt(baseInputs[1])
+		Q.Y.A0.SetBigInt(baseInputs[2])
+		Q.Y.A1.SetBigInt(baseInputs[3])
+		Q.ScalarMultiplication(&Q, m)
+		Q.X.A0.BigInt(baseOutputs[0])
+		Q.X.A1.BigInt(baseOutputs[1])
+		Q.Y.A0.BigInt(baseOutputs[2])
+		Q.Y.A1.BigInt(baseOutputs[3])
+		return nil
+	})
 }
 
 func finalExpHint(nativeMod *big.Int, nativeInputs, nativeOutputs []*big.Int) error {
@@ -277,4 +344,95 @@ func finalExpWitness(millerLoop *bn254.E12) (residueWitness, cubicNonResiduePowe
 	residueWitness.Set(&x)
 
 	return residueWitness, cubicNonResiduePower
+}
+
+func scalarMulG2Hint(field *big.Int, inputs []*big.Int, outputs []*big.Int) error {
+	return emulated.UnwrapHintContext(field, inputs, outputs, func(hc emulated.HintContext) error {
+		moduli := hc.EmulatedModuli()
+		if len(moduli) != 2 {
+			return fmt.Errorf("expecting two moduli, got %d", len(moduli))
+		}
+		baseModulus, scalarModulus := moduli[0], moduli[1]
+		baseInputs, baseOutputs := hc.InputsOutputs(baseModulus)
+		scalarInputs, _ := hc.InputsOutputs(scalarModulus)
+		if len(baseInputs) != 4 {
+			return fmt.Errorf("expecting four base inputs (Q.X.A0, Q.X.A1, Q.Y.A0, Q.Y.A1), got %d", len(baseInputs))
+		}
+		if len(baseOutputs) != 4 {
+			return fmt.Errorf("expecting four base outputs, got %d", len(baseOutputs))
+		}
+		if len(scalarInputs) != 1 {
+			return fmt.Errorf("expecting one scalar input, got %d", len(scalarInputs))
+		}
+
+		// compute the resulting point [s]Q on G2
+		var Q bn254.G2Affine
+		Q.X.A0.SetBigInt(baseInputs[0])
+		Q.X.A1.SetBigInt(baseInputs[1])
+		Q.Y.A0.SetBigInt(baseInputs[2])
+		Q.Y.A1.SetBigInt(baseInputs[3])
+		Q.ScalarMultiplication(&Q, scalarInputs[0])
+		Q.X.A0.BigInt(baseOutputs[0])
+		Q.X.A1.BigInt(baseOutputs[1])
+		Q.Y.A0.BigInt(baseOutputs[2])
+		Q.Y.A1.BigInt(baseOutputs[3])
+		return nil
+	})
+}
+
+func rationalReconstructExtG2(mod *big.Int, inputs []*big.Int, outputs []*big.Int) error {
+	return emulated.UnwrapHintContext(mod, inputs, outputs, func(hc emulated.HintContext) error {
+		moduli := hc.EmulatedModuli()
+		if len(moduli) != 1 {
+			return fmt.Errorf("expecting one modulus, got %d", len(moduli))
+		}
+		_, nativeOutputs := hc.NativeInputsOutputs()
+		if len(nativeOutputs) != 4 {
+			return fmt.Errorf("expecting four outputs, got %d", len(nativeOutputs))
+		}
+		emuInputs, emuOutputs := hc.InputsOutputs(moduli[0])
+		if len(emuInputs) != 2 {
+			return fmt.Errorf("expecting two inputs, got %d", len(emuInputs))
+		}
+		if len(emuOutputs) != 4 {
+			return fmt.Errorf("expecting four outputs, got %d", len(emuOutputs))
+		}
+
+		// Use lattice reduction to find (x, y, z, t) such that
+		// k ≡ (x + λ*y) / (z + λ*t) (mod r)
+		//
+		// in-circuit we check that R - [s]Q = 0 or equivalently R + [-s]Q = 0
+		// so here we use k = -s.
+		k := new(big.Int).Neg(emuInputs[0])
+		k.Mod(k, moduli[0])
+		rc := lattice.NewReconstructor(moduli[0]).SetLambda(emuInputs[1])
+		res := rc.RationalReconstructExt(k)
+		x, y, z, t := res[0], res[1], res[2], res[3]
+
+		// u1 = x, u2 = y, v1 = z, v2 = t
+		emuOutputs[0].Abs(x)
+		emuOutputs[1].Abs(y)
+		emuOutputs[2].Abs(z)
+		emuOutputs[3].Abs(t)
+
+		// signs
+		nativeOutputs[0].SetUint64(0)
+		nativeOutputs[1].SetUint64(0)
+		nativeOutputs[2].SetUint64(0)
+		nativeOutputs[3].SetUint64(0)
+
+		if x.Sign() < 0 {
+			nativeOutputs[0].SetUint64(1)
+		}
+		if y.Sign() < 0 {
+			nativeOutputs[1].SetUint64(1)
+		}
+		if z.Sign() < 0 {
+			nativeOutputs[2].SetUint64(1)
+		}
+		if t.Sign() < 0 {
+			nativeOutputs[3].SetUint64(1)
+		}
+		return nil
+	})
 }

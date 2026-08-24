@@ -2,6 +2,7 @@ package fields_bls12377
 
 import (
 	"github.com/consensys/gnark/frontend"
+	"github.com/consensys/gnark/internal/frontendtype"
 )
 
 // nSquareKarabina2345 repeated compressed cyclotmic square
@@ -47,7 +48,17 @@ func (e *E12) Square034(api frontend.API, x E12) *E12 {
 
 // MulBy034 multiplication by sparse element
 func (e *E12) MulBy034(api frontend.API, c3, c4 E2) *E12 {
+	if ft, ok := api.Compiler().(frontendtype.FrontendTyper); ok {
+		if ft.FrontendType() == frontendtype.SCS {
+			if _, ok := api.(frontend.Committer); ok {
+				return e.mulBy034SZ(api, c3, c4)
+			}
+		}
+	}
+	return e.mulBy034Karatsuba(api, c3, c4)
+}
 
+func (e *E12) mulBy034Karatsuba(api frontend.API, c3, c4 E2) *E12 {
 	var d E6
 
 	a := e.C0
@@ -60,6 +71,47 @@ func (e *E12) MulBy034(api frontend.API, c3, c4 E2) *E12 {
 
 	e.C1.Add(api, a, b).Neg(api, e.C1).Add(api, e.C1, d)
 	e.C0.MulByNonResidue(api, b).Add(api, e.C0, a)
+
+	return e
+}
+
+// mulBy034SZ computes e = e * sparse(1,0,0,c3,c4,0) using SZ.
+// The sparse element has only 5 nonzero monomial coefficients:
+// mono[0]=1 (const), mono[1]=c3.A0, mono[3]=c4.A0, mono[7]=c3.A1, mono[9]=c4.A1.
+func (e *E12) mulBy034SZ(api frontend.API, c3, c4 E2) *E12 {
+	aCoeffs := e12Coeffs(e)
+	in := make([]frontend.Variable, 16)
+	copy(in[:12], aCoeffs[:])
+	in[12] = c3.A0
+	in[13] = c3.A1
+	in[14] = c4.A0
+	in[15] = c4.A1
+
+	out, err := api.Compiler().NewHint(mulBy034E12SZHint, 23, in...)
+	if err != nil {
+		panic(err)
+	}
+
+	assignE12(e, out[:12])
+
+	var q [11]frontend.Variable
+	copy(q[:], out[12:23])
+
+	aMono := towerToMonomial12(aCoeffs)
+	cMono := towerToMonomial12(e12Coeffs(e))
+
+	// build sparse b in monomial form
+	var bMono [12]frontend.Variable
+	for i := range bMono {
+		bMono[i] = 0
+	}
+	bMono[0] = frontend.Variable(1) // constant 1
+	bMono[1] = c3.A0
+	bMono[3] = c4.A0
+	bMono[7] = c3.A1
+	bMono[9] = c4.A1
+
+	addSZCheck(api, aMono[:], bMono[:], cMono[:], q[:])
 
 	return e
 }
@@ -107,6 +159,30 @@ func Mul01234By034(api frontend.API, x [5]E2, z3, z4 E2) *E12 {
 }
 
 func (e *E12) MulBy01234(api frontend.API, x [5]E2) *E12 {
+	if ft, ok := api.Compiler().(frontendtype.FrontendTyper); ok {
+		if ft.FrontendType() == frontendtype.SCS {
+			if _, ok := api.(frontend.Committer); ok {
+				return e.mulBy01234SZ(api, x)
+			}
+		}
+	}
+	return e.mulBy01234Karatsuba(api, x)
+}
+
+func (e *E12) mulBy01234SZ(api frontend.API, x [5]E2) *E12 {
+	// reconstruct sparse E12: C0=(x[0],x[1],x[2]), C1=(x[3],x[4],0)
+	var b E12
+	b.C0.B0 = x[0]
+	b.C0.B1 = x[1]
+	b.C0.B2 = x[2]
+	b.C1.B0 = x[3]
+	b.C1.B1 = x[4]
+	b.C1.B2.SetZero()
+	// use generic mulSZ — the b is almost dense (10/12 nonzero)
+	return e.mulSZ(api, *e, b)
+}
+
+func (e *E12) mulBy01234Karatsuba(api frontend.API, x [5]E2) *E12 {
 	var a, b, c, z1, z0 E6
 	c0 := &E6{B0: x[0], B1: x[1], B2: x[2]}
 	a.Add(api, e.C0, e.C1)
@@ -204,42 +280,4 @@ func (e *E12) ExpU(api frontend.API, e1 E12) *E12 {
 	e.nSquareKarabina2345(api, 92)
 
 	return e
-}
-
-// AssertFinalExponentiationIsOne checks that a Miller function output x lies in the
-// same equivalence class as the reduced pairing. This replaces the final
-// exponentiation step in-circuit.
-// The method follows Section 4 of [On Proving Pairings] paper by A. Novakovic and L. Eagen.
-//
-// [On Proving Pairings]: https://eprint.iacr.org/2024/640.pdf
-func (e *E12) AssertFinalExponentiationIsOne(api frontend.API) {
-	res, err := api.NewHint(finalExpHint, 18, e.C0.B0.A0, e.C0.B0.A1, e.C0.B1.A0, e.C0.B1.A1, e.C0.B2.A0, e.C0.B2.A1, e.C1.B0.A0, e.C1.B0.A1, e.C1.B1.A0, e.C1.B1.A1, e.C1.B2.A0, e.C1.B2.A1)
-	if err != nil {
-		// err is non-nil only for invalid number of inputs
-		panic(err)
-	}
-
-	var residueWitness, t0, t1 E12
-	var scalingFactor E6
-	residueWitness.assign(res[:12])
-	// constrain cubicNonResiduePower to be in Fp6
-	scalingFactor.B0.A0 = res[12]
-	scalingFactor.B0.A1 = res[13]
-	scalingFactor.B1.A0 = res[14]
-	scalingFactor.B1.A1 = res[15]
-	scalingFactor.B2.A0 = res[16]
-	scalingFactor.B2.A1 = res[17]
-
-	// Check that  x * scalingFactor == residueWitness^(q-u)
-	// where u=0x8508c00000000001 is the BLS12-377 seed,
-	// and residueWitness, scalingFactor from the hint.
-	t0.Frobenius(api, residueWitness)
-	// exponentiation by u
-	t1.ExpX0(api, residueWitness)
-	t0.DivUnchecked(api, t0, t1)
-
-	t1.C0.Mul(api, e.C0, scalingFactor)
-	t1.C1.Mul(api, e.C1, scalingFactor)
-
-	t0.AssertIsEqual(api, t1)
 }

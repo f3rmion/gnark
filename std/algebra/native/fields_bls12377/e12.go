@@ -9,6 +9,7 @@ import (
 	bls12377 "github.com/consensys/gnark-crypto/ecc/bls12-377"
 
 	"github.com/consensys/gnark/frontend"
+	"github.com/consensys/gnark/internal/frontendtype"
 )
 
 // Extension stores the non residue elmt for an extension of type Fp->Fp2->Fp6->Fp12 (Fp2 = Fp(u), Fp6 = Fp2(v), Fp12 = Fp6(w))
@@ -137,7 +138,18 @@ func (e *E12) Neg(api frontend.API, e1 E12) *E12 {
 
 // Mul multiplies 2 elmts in Fp12
 func (e *E12) Mul(api frontend.API, e1, e2 E12) *E12 {
+	if ft, ok := api.Compiler().(frontendtype.FrontendTyper); ok {
+		if ft.FrontendType() == frontendtype.SCS {
+			if _, ok := api.(frontend.Committer); ok {
+				return e.mulSZ(api, e1, e2)
+			}
+		}
+	}
+	return e.mulKaratsuba(api, e1, e2)
+}
 
+// mulKaratsuba computes e = e1 * e2 using the Karatsuba tower (3 E6 muls).
+func (e *E12) mulKaratsuba(api frontend.API, e1, e2 E12) *E12 {
 	var u, v, ac, bd E6
 	u.Add(api, e1.C0, e1.C1)
 	v.Add(api, e2.C0, e2.C1)
@@ -153,9 +165,52 @@ func (e *E12) Mul(api frontend.API, e1, e2 E12) *E12 {
 	return e
 }
 
+// mulSZ computes e = e1 * e2 using the Schwartz-Zippel technique.
+// The prover witnesses the result c and quotient q, then defers a check
+// a(r)*b(r) = q(r)*P(r) + c(r) at a random challenge r, where P(X) = X^12 + 5.
+// Soundness: 22/p ≈ 2^{-372} per check.
+func (e *E12) mulSZ(api frontend.API, e1, e2 E12) *E12 {
+	aCoeffs := e12Coeffs(&e1)
+	bCoeffs := e12Coeffs(&e2)
+	in := make([]frontend.Variable, 24)
+	copy(in[:12], aCoeffs[:])
+	copy(in[12:], bCoeffs[:])
+
+	out, err := api.Compiler().NewHint(mulE12SZHint, 23, in...)
+	if err != nil {
+		panic(err)
+	}
+
+	// first 12 outputs: c in tower basis
+	assignE12(e, out[:12])
+
+	// last 11 outputs: q in monomial basis
+	var q [11]frontend.Variable
+	copy(q[:], out[12:23])
+
+	// convert a, b, c to monomial
+	aMono := towerToMonomial12(aCoeffs)
+	bMono := towerToMonomial12(bCoeffs)
+	cMono := towerToMonomial12(e12Coeffs(e))
+
+	addSZCheck(api, aMono[:], bMono[:], cMono[:], q[:])
+
+	return e
+}
+
 // Square squares an element in Fp12
 func (e *E12) Square(api frontend.API, x E12) *E12 {
+	if ft, ok := api.Compiler().(frontendtype.FrontendTyper); ok {
+		if ft.FrontendType() == frontendtype.SCS {
+			if _, ok := api.(frontend.Committer); ok {
+				return e.squareSZ(api, x)
+			}
+		}
+	}
+	return e.squareKaratsuba(api, x)
+}
 
+func (e *E12) squareKaratsuba(api frontend.API, x E12) *E12 {
 	//Algorithm 22 from https://eprint.iacr.org/2010/354.pdf
 	var c0, c2, c3 E6
 	c0.Sub(api, x.C0, x.C1)
@@ -166,6 +221,31 @@ func (e *E12) Square(api frontend.API, x E12) *E12 {
 	e.C1.Double(api, c2)
 	c2.MulByNonResidue(api, c2)
 	e.C0.Add(api, c0, c2)
+
+	return e
+}
+
+// squareSZ computes e = x² using the Schwartz-Zippel technique.
+// Like mulSZ but evaluates a(r) only once (saving 11 gates vs mulSZ).
+func (e *E12) squareSZ(api frontend.API, x E12) *E12 {
+	aCoeffs := e12Coeffs(&x)
+	in := make([]frontend.Variable, 12)
+	copy(in, aCoeffs[:])
+
+	out, err := api.Compiler().NewHint(squareE12SZHint, 23, in...)
+	if err != nil {
+		panic(err)
+	}
+
+	assignE12(e, out[:12])
+
+	var q [11]frontend.Variable
+	copy(q[:], out[12:23])
+
+	aMono := towerToMonomial12(aCoeffs)
+	cMono := towerToMonomial12(e12Coeffs(e))
+
+	addSZSquareCheck(api, aMono[:], cMono[:], q[:])
 
 	return e
 }
@@ -359,11 +439,20 @@ func (e *E12) DecompressKarabina2345(api frontend.API, x E12) *E12 {
 	// g4 = (E * g5^2 + 3 * g1^2 - 2 * g2)/4g3 or (2 * g1 * g5)/g2
 	t[0].Select(api, selector1, _t[0], t[0])
 	t[1].Select(api, selector1, _t[1], t[1])
-	// if g2 == g3 == 0 we do nothing as DivUnchecked sets g4 to 0
-	// and all gi to 0 returning, correctly in this case, at the end:
-	// e = E * (2 * g4² + g3 * g5 - 3 * g2 * g1) + 1 = 1
-
-	e.C1.B1.DivUnchecked(api, t[0], t[1])
+	// When g2 == g3 == 0 the denominator t1 is 0. A plain DivUnchecked(t0, 0)
+	// only enforces g4·0 == t0, i.e. 0 == 0 (t0 is also 0 in this case), leaving
+	// g4 a free, prover-chosen hint value — a soundness gap. The only reachable
+	// element with g2 == g3 == 0 is the identity (g1 == g5 == 0 too), whose
+	// honest decompression has g4 = 0 and gives e = 1. So pin g4 = 0 here instead
+	// of relying on the hint; non-degenerate steps (t1 != 0) are unchanged.
+	t1IsZero := t[1].IsZero(api)
+	var one2, zero2, t1Safe E2
+	one2.SetOne()
+	zero2.SetZero()
+	t1Safe.Select(api, t1IsZero, one2, t[1])
+	e.C1.B1.DivUnchecked(api, t[0], t1Safe)
+	g4 := e.C1.B1
+	e.C1.B1.Select(api, t1IsZero, zero2, g4)
 
 	// Rest of the computation for all cases
 	// t1 = g2 * g1
